@@ -134,7 +134,8 @@ class StructuredTensor(composite_tensor.CompositeTensor):
     self._fields = fields
     self._shape = shape
     self._nrows = nrows
-    self._row_partitions = row_partitions
+    self._ragged_shape = _dynamic_ragged_shape_init(fields, shape, nrows,
+                                                    row_partitions)
 
   @classmethod
   def from_fields(cls,
@@ -560,7 +561,7 @@ class StructuredTensor(composite_tensor.CompositeTensor):
   @property
   def rank(self):
     """The rank of this StructuredTensor.  Guaranteed not to be `None`."""
-    return self._shape.rank
+    return self._ragged_shape.rank
 
   @property
   def shape(self):
@@ -630,7 +631,9 @@ class StructuredTensor(composite_tensor.CompositeTensor):
       (or `0` if `self.rank < 2`)
 
     """
-    return self._row_partitions
+    if self.rank < 2:
+      return ()
+    return self._ragged_shape._as_row_partitions()  # pylint:disable=protected-access
 
   def nrows(self):
     """The number of rows in this StructuredTensor (if rank>0).
