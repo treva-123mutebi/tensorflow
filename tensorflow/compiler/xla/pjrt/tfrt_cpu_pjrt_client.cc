@@ -21,6 +21,7 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "tensorflow/compiler/xla/util.h"
 
 #define EIGEN_USE_THREADS
 
@@ -1083,7 +1084,7 @@ StatusOr<std::unique_ptr<PjRtBuffer>> TfrtCpuBuffer::CopyToDevice(
 
   // Copying across PjRtClients involves a copy through the host.
   if (dst_device->client() != client_) {
-    TF_ASSIGN_OR_RETURN(std::shared_ptr<Literal> literal, ToLiteral());
+    TF_ASSIGN_OR_RETURN(std::shared_ptr<Literal> literal, ToLiteralSync());
     // Avoid use-after-free on `literal` due to unsequenced move and use.
     Literal* literal_pointer = literal.get();
     absl::InlinedVector<int64_t, 4> byte_strides(
@@ -1193,69 +1194,49 @@ StatusOr<std::unique_ptr<PjRtBuffer>> TfrtCpuBuffer::CopyToDevice(
       client(), tensorflow::down_cast<TfrtCpuDevice*>(dst_device)));
 }
 
-Status TfrtCpuBuffer::BlockHostUntilReady() {
-  tensorflow::profiler::TraceMe traceme("TfrtCpuBuffer::BlockHostUntilReady");
-  std::shared_ptr<TrackedTfrtCpuDeviceBuffer> device_buffer;
-  {
-    absl::MutexLock lock(&mu_);
-    if (tracked_device_buffer_ == nullptr) {
-      return InvalidArgument(
-          "BlockHostUntilReady() called on deleted or donated buffer");
+PjRtEvent<Status> TfrtCpuBuffer::GetEvent() {
+  absl::MutexLock lock(&mu_);
+  if (tracked_device_buffer_) {
+    auto done_event = tfrt::MakeUnconstructedAsyncValueRef<Status>();
+    absl::InlinedVector<tfrt::RCReference<tfrt::AsyncValue>, 4> events;
+    absl::InlinedVector<tfrt::RCReference<tfrt::AsyncValue>, 4> events_to_copy;
+    events.reserve(tracked_device_buffer_->DefinitionEvents().size());
+    events_to_copy.reserve(tracked_device_buffer_->DefinitionEvents().size());
+    for (const auto& ev : tracked_device_buffer_->DefinitionEvents()) {
+      events.push_back(ev.CopyRCRef());
+      events_to_copy.push_back(ev.CopyRCRef());
     }
-    device_buffer = tracked_device_buffer_;
-  }
-
-  // Wait for all definition events to complete.
-  Status status;
-  for (const auto& ev : device_buffer->DefinitionEvents()) {
-    client_->GetHostContext()->Await(ev.CopyRCRef());
-    if (auto* error = ev.GetErrorIfPresent()) {
-      status.Update(FailedPrecondition(
-          "Error in BlockHostUntilReady waiting for definition events: %s",
-          error->message));
-    }
-  }
-  return status;
-}
-
-void TfrtCpuBuffer::OnReady(std::function<void(Status)> callback) {
-  std::shared_ptr<TrackedTfrtCpuDeviceBuffer> device_buffer;
-  {
-    absl::MutexLock lock(&mu_);
-    if (tracked_device_buffer_ == nullptr) {
-      callback(
-          InvalidArgument("OnReady() called on deleted or donated buffer"));
-      return;
-    }
-    device_buffer = tracked_device_buffer_;
-  }
-
-  std::vector<tfrt::RCReference<tfrt::AsyncValue>> avs;
-  avs.reserve(device_buffer->DefinitionEvents().size());
-  // Wait for all definition events to complete.
-  for (const auto& ev : device_buffer->DefinitionEvents()) {
-    avs.push_back(ev.CopyRCRef());
-  }
-
-  absl::InlinedVector<tfrt::RCReference<tfrt::AsyncValue>, 4> avs_to_move;
-  avs_to_move.reserve(avs.size());
-  for (const auto& av : avs) {
-    avs_to_move.push_back(av.CopyRef());
-  }
-
-  EnqueueWorkWhenReady(
-      client_->GetHostContext(), avs,
-      [avs = std::move(avs_to_move), callback = std::move(callback)]() {
-        Status s;
-        for (const auto& av : avs) {
-          if (auto* error = av->GetErrorIfPresent()) {
-            s.Update(FailedPrecondition(
-                "Error in OnReady waiting for buffer ready: %s",
-                error->message));
+    tfrt::RunWhenReady(
+        {events.begin(), events.end()}, [done_event = done_event.CopyRef(),
+                                         events = std::move(events_to_copy)]() {
+          Status s;
+          for (const auto& e : events) {
+            if (auto* error = e->GetErrorIfPresent()) {
+              s.Update(FailedPrecondition("Buffer Definition Event: %s",
+                                          error->message));
+            }
           }
-        }
-        callback(s);
-      });
+          done_event.emplace(s);
+        });
+    return PjRtEvent<Status>(
+        client_->GetHostContext(), std::move(done_event),
+        /*on_block_start=*/
+        []() {
+          tensorflow::profiler::TraceMeProducer traceme(
+              "TfrtCpuBuffer::BlockHostUntilReady");
+          VLOG(1) << "TfrtCpuBuffer::BlockHostUntilReady";
+          return PjRtEvent<Status>::ProfilingKeys(
+              {.traceme_context_id = traceme.GetContextId()});
+        },
+        /*on_block_end=*/
+        [](PjRtEvent<Status>::ProfilingKeys keys) {
+          tensorflow::profiler::TraceMeConsumer traceme(
+              "TfrtCpuBuffer::BlockHostUntilReady", keys.traceme_context_id);
+        });
+  } else {
+    return PjRtEvent<Status>(
+        InvalidArgument("GetEvent() called on deleted or donated buffer"));
+  }
 }
 
 TfrtCpuExecutable::TfrtCpuExecutable(
