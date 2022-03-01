@@ -27,6 +27,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/layout.h"
 #include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/pjrt/pjrt_client.h"
+#include "tensorflow/compiler/xla/pjrt/pjrt_event.h"
 #include "tensorflow/compiler/xla/pjrt/semaphore.h"
 #include "tensorflow/compiler/xla/pjrt/tracked_tfrt_cpu_device_buffer.h"
 #include "tensorflow/compiler/xla/pjrt/transpose.h"
@@ -433,9 +434,8 @@ class TfrtCpuBuffer final : public PjRtBuffer {
   StatusOr<std::unique_ptr<ExternalReference>> ReleaseDeviceMemoryOwnership(
       bool wait_for_operations_to_complete) override;
 
-  using PjRtBuffer::ToLiteral;
-  void ToLiteral(MutableLiteralBase* literal,
-                 std::function<void(Status)> on_ready) override;
+  using PjRtBuffer::ToLiteralSync;
+  PjRtEvent<Status> ToLiteral(MutableLiteralBase* literal) override;
 
   StatusOr<size_t> GetOnDeviceSizeInBytes() const override;
 
@@ -468,9 +468,7 @@ class TfrtCpuBuffer final : public PjRtBuffer {
     }
   }
 
-  Status BlockHostUntilReady() override;
-
-  void OnReady(std::function<void(Status)> callback) override;
+  PjRtEvent<Status> GetEvent() override;
 
   bool IsOnCpu() const override { return true; }
 

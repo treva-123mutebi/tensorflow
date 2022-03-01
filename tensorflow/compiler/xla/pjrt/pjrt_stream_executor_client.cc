@@ -94,6 +94,8 @@ limitations under the License.
 #include "tensorflow/compiler/xla/pjrt/local_device_state.h"
 #include "tensorflow/compiler/xla/pjrt/metrics.h"
 #include "tensorflow/compiler/xla/pjrt/mlir_to_hlo.h"
+#include "tensorflow/compiler/xla/pjrt/pjrt_client.h"
+#include "tensorflow/compiler/xla/pjrt/pjrt_event.h"
 #include "tensorflow/compiler/xla/pjrt/tracked_device_buffer.h"
 #include "tensorflow/compiler/xla/pjrt/utils.h"
 #include "tensorflow/compiler/xla/service/computation_layout.h"
@@ -113,6 +115,7 @@ limitations under the License.
 #include "tensorflow/core/platform/fingerprint.h"
 #include "tensorflow/core/platform/mem.h"
 #include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/platform/statusor.h"
 #include "tensorflow/core/profiler/lib/connected_traceme.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/profiler/lib/traceme_encode.h"
@@ -215,6 +218,7 @@ PjRtStreamExecutorClient::PjRtStreamExecutorClient(
       thread_pool_(
           tensorflow::Env::Default(), "pjrt_thread_pool",
           std::max<int>(DefaultThreadPoolSize(), client->device_count())),
+      event_ctx_(PjRtEventContext::Create()),
       transpose_cache_(1024) {
   if (owned_allocator_ != nullptr) {
     allocator_ = owned_allocator_.get();
@@ -1313,12 +1317,12 @@ void PjRtStreamExecutorBuffer::DropHold(ScopedHold::Type type,
   }
 }
 
-void PjRtStreamExecutorBuffer::ToLiteral(MutableLiteralBase* literal,
-                                         std::function<void(Status)> on_ready) {
+PjRtEvent<Status> PjRtStreamExecutorBuffer::ToLiteral(
+    MutableLiteralBase* literal) {
   VLOG(1) << "PjRtStreamExecutorBuffer::ToLiteral";
   if (IsEmptyTuple()) {
-    on_ready(InvalidArgument("ToLiteral called on empty tuple"));
-    return;
+    return PjRtEvent<Status>(
+        InvalidArgument("ToLiteral called on empty tuple"));
   }
   LocalDeviceState* local_device = device_->local_device_state();
   se::Stream* stream = local_device->GetDeviceToHostStream();
@@ -1328,9 +1332,8 @@ void PjRtStreamExecutorBuffer::ToLiteral(MutableLiteralBase* literal,
     // We can't perform any other action while a donation hold is in progress.
     WaitForOutstandingDonationHold();
     if (device_buffer_ == nullptr) {
-      on_ready(InvalidArgument(
+      return PjRtEvent<Status>(InvalidArgument(
           "CopyToHostAsync() called on deleted or donated buffer"));
-      return;
     }
     AcquireHoldLocked(&device_buffer);
   }
@@ -1340,11 +1343,12 @@ void PjRtStreamExecutorBuffer::ToLiteral(MutableLiteralBase* literal,
   StatusOr<EventPool::Handle> event_or =
       local_device->event_pool().AllocateEvent(stream->parent());
   if (!event_or.ok()) {
-    on_ready(event_or.status());
-    return;
+    return PjRtEvent<Status>(event_or.status());
   }
+  auto ready_event = PjRtEvent<Status>::Event::Create();
   client_->client()->backend().transfer_manager()->TransferLiteralFromDevice(
-      stream, shaped_buffer, literal, std::move(on_ready));
+      stream, shaped_buffer, literal,
+      [ready_event](Status status) mutable { ready_event.Set(status); });
 
   auto usage_event = std::make_shared<BufferSequencingEvent>();
   local_device->event_pool().ThenRecordEvent(stream, event_or.ValueOrDie());
@@ -1361,6 +1365,22 @@ void PjRtStreamExecutorBuffer::ToLiteral(MutableLiteralBase* literal,
   RecordUsage(std::move(device_buffer), local_device, local_device, usage_event,
               stream,
               /*prefer_to_retain_reference=*/true);
+
+  return PjRtEvent<Status>(
+      client_->event_ctx(), std::move(ready_event),
+      /*on_block_start=*/
+      []() {
+        tensorflow::profiler::TraceMeProducer traceme(
+            "PjRtStreamExecutorBuffer::ToLiteral");
+        VLOG(1) << "PjRtStreamExecutorBuffer::ToLiteral";
+        return PjRtEvent<Status>::ProfilingKeys(
+            {.traceme_context_id = traceme.GetContextId()});
+      },
+      /*on_block_end=*/
+      [](PjRtEvent<Status>::ProfilingKeys keys) {
+        tensorflow::profiler::TraceMeConsumer traceme(
+            "PjRtStreamExecutorBuffer::ToLiteral", keys.traceme_context_id);
+      });
 }
 
 StatusOr<size_t> PjRtStreamExecutorBuffer::GetOnDeviceSizeInBytes() const {
@@ -1476,7 +1496,7 @@ StatusOr<std::unique_ptr<PjRtBuffer>> PjRtStreamExecutorBuffer::CopyToDevice(
 
   // Copying across PjRtClients involves a copy through the host.
   if (dst_device->client() != client_) {
-    TF_ASSIGN_OR_RETURN(std::shared_ptr<Literal> literal, ToLiteral());
+    TF_ASSIGN_OR_RETURN(std::shared_ptr<Literal> literal, ToLiteralSync());
     // Avoid use-after-free on `literal` due to unsequenced move and use.
     Literal* literal_pointer = literal.get();
     absl::InlinedVector<int64_t, 4> byte_strides(
@@ -1557,69 +1577,64 @@ void PjRtStreamExecutorBuffer::CopyToRemoteDeviceScattered(
       this, serialized_descriptors_and_callbacks, scatter_details);
 }
 
-Status PjRtStreamExecutorBuffer::BlockHostUntilReady() {
-  tensorflow::profiler::TraceMe traceme(
-      "PjRtStreamExecutorBuffer::BlockHostUntilReady");
-  VLOG(1) << "PjRtStreamExecutorBuffer::BlockHostUntilReady";
+PjRtEvent<Status> PjRtStreamExecutorBuffer::GetEvent() {
   std::shared_ptr<TrackedDeviceBuffer> device_buffer;
+  PjRtEvent<Status>::Event definition_event;
   {
     absl::MutexLock lock(&mu_);
     if (device_buffer_ == nullptr) {
-      return InvalidArgument(
-          "BlockHostUntilReady() called on deleted or donated buffer");
+      return PjRtEvent<Status>(
+          InvalidArgument("GetEvent() called on deleted or donated buffer"));
     }
-    device_buffer = device_buffer_;
-  }
-  LocalDeviceState* local_device_state = device_->local_device_state();
-  std::unique_ptr<se::Stream> stream;
-  for (auto& event : device_buffer->definition_events()) {
-    if (!event->IsComplete()) {
-      if (stream == nullptr) {
-        stream = local_device_state->BorrowStreamFromPool();
-      }
-      event->WaitForEventOnStream(stream.get());
+    if (!definition_event_) {
+      device_buffer = device_buffer_;
+      definition_event_ = PjRtEvent<Status>::Event::Create();
     }
+    definition_event = definition_event_;
   }
-  if (stream != nullptr) {
-    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
-    local_device_state->ReturnStreamToPool(std::move(stream));
-  }
-  return Status::OK();
-}
 
-void PjRtStreamExecutorBuffer::OnReady(std::function<void(Status)> callback) {
-  std::shared_ptr<TrackedDeviceBuffer> device_buffer;
-  {
-    absl::MutexLock lock(&mu_);
-    if (device_buffer_ == nullptr) {
-      callback(
-          InvalidArgument("OnReady() called on deleted or donated buffer"));
-      return;
-    }
-    device_buffer = device_buffer_;
-  }
-  LocalDeviceState* local_device_state = device_->local_device_state();
-  std::unique_ptr<se::Stream> stream;
-  for (auto& event : device_buffer->definition_events()) {
-    if (!event->IsComplete()) {
-      if (stream == nullptr) {
-        stream = local_device_state->BorrowStreamFromPool();
+  if (device_buffer) {
+    LocalDeviceState* local_device_state = device_->local_device_state();
+    std::unique_ptr<se::Stream> stream;
+    for (auto& event : device_buffer->definition_events()) {
+      if (!event->IsComplete()) {
+        if (stream == nullptr) {
+          stream = local_device_state->BorrowStreamFromPool();
+        }
+        event->WaitForEventOnStream(stream.get());
       }
-      event->WaitForEventOnStream(stream.get());
+    }
+    if (stream != nullptr) {
+      auto* stream_ptr = stream.release();
+      local_device_state->ThenExecuteCallback(
+          stream_ptr,
+          [definition_event, stream_ptr, local_device_state]() mutable {
+            definition_event.Set(Status::OK());
+            local_device_state->ReturnStreamToPool(
+                std::unique_ptr<se::Stream>(stream_ptr));
+          });
+    } else {
+      // All events are already complete.
+      definition_event.Set(Status::OK());
     }
   }
-  if (stream == nullptr) {
-    callback(Status::OK());
-  } else {
-    auto* stream_ptr = stream.release();
-    local_device_state->ThenExecuteCallback(
-        stream_ptr,
-        [callback = std::move(callback), stream_ptr, local_device_state]() {
-          callback(Status::OK());
-          local_device_state->ReturnStreamToPool(
-              std::unique_ptr<se::Stream>(stream_ptr));
-        });
-  }
+
+  return PjRtEvent<Status>(
+      client_->event_ctx(), std::move(definition_event),
+      /*on_block_start=*/
+      []() {
+        tensorflow::profiler::TraceMeProducer traceme(
+            "PjRtStreamExecutorBuffer::BlockHostUntilReady");
+        VLOG(1) << "PjRtStreamExecutorBuffer::BlockHostUntilReady";
+        return PjRtEvent<Status>::ProfilingKeys(
+            {.traceme_context_id = traceme.GetContextId()});
+      },
+      /*on_block_end=*/
+      [](PjRtEvent<Status>::ProfilingKeys keys) {
+        tensorflow::profiler::TraceMeConsumer traceme(
+            "PjRtStreamExecutorBuffer::BlockHostUntilReady",
+            keys.traceme_context_id);
+      });
 }
 
 namespace {
